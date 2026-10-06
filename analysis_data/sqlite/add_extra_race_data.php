@@ -419,18 +419,35 @@ try {
     $stmt->execute([$raceId]);
 
     if ($refundText !== '') {
+        preg_match_all('/[1-6]/', $refundText, $matches);
+        $refundBoats = array_values(array_unique(
+            array_map('intval', $matches[0])
+        ));
+
         $stmt = $pdo->prepare(
             'INSERT INTO refunds (
                 race_id,
                 boat_number,
                 refund_text
-            ) VALUES (?, NULL, ?)'
+            ) VALUES (?, ?, ?)'
         );
 
-        $stmt->execute([
-            $raceId,
-            $refundText,
-        ]);
+        foreach ($refundBoats as $refundBoatNumber) {
+            $stmt->execute([
+                $raceId,
+                $refundBoatNumber,
+                $refundText,
+            ]);
+        }
+
+        // 艇番を判定できない特殊な返還表記も原文を失わない
+        if (!$refundBoats) {
+            $stmt->execute([
+                $raceId,
+                null,
+                $refundText,
+            ]);
+        }
     }
 
     $pdo->commit();
