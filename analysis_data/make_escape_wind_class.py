@@ -2,11 +2,11 @@ from pathlib import Path
 from collections import defaultdict
 from datetime import date
 import json
+import csv
 
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment
 from openpyxl.utils import get_column_letter
-from openpyxl.worksheet.table import Table, TableStyleInfo
 
 
 # =========================
@@ -21,6 +21,8 @@ START_DATE = date(2024, 1, 1)
 END_DATE = date(2026, 10, 5)
 
 OUTPUT_FILE = DATA_DIR / "boat_escape_wind_class_20240101_20261005.xlsx"
+
+STABILIZER_FILE = DATA_DIR / "stabilizer_results.csv"
 
 
 STADIUMS = {
@@ -51,8 +53,17 @@ STADIUMS = {
 }
 
 
-# BOAT RACE結果データの決まり手番号
-WIND_DIRECTIONS = {1:"北",2:"北",3:"北東",4:"東",5:"東",6:"東",7:"南東",8:"南",9:"南",10:"南",11:"南西",12:"西",13:"西",14:"西",15:"北西",16:"北",17:"無風"}
+WIND_DIRECTIONS = {
+    1: "北", 2: "北", 3: "北東",
+    4: "東", 5: "東", 6: "東",
+    7: "南東",
+    8: "南", 9: "南", 10: "南",
+    11: "南西",
+    12: "西", 13: "西", 14: "西",
+    15: "北西", 16: "北",
+    17: "無風",
+}
+
 
 TECHNIQUES = {
     1: "逃げ",
@@ -64,9 +75,10 @@ TECHNIQUES = {
 }
 
 
+# =========================
 # 期別級別ファイル
-# 前期：1/1～6/30
-# 後期：7/1～12/31
+# =========================
+
 GRADE_FILES = [
     (date(2024, 1, 1), date(2024, 6, 30), "fan2310.txt"),
     (date(2024, 7, 1), date(2024, 12, 31), "fan2404.txt"),
@@ -76,6 +88,51 @@ GRADE_FILES = [
     (date(2026, 7, 1), date(2026, 12, 31), "fan2604.txt"),
 ]
 
+
+
+def load_stabilizer_data():
+    """安定板CSVから (日付, 場番号, R) → 有/無 を取得"""
+    if not STABILIZER_FILE.exists():
+        raise FileNotFoundError(
+            f"安定板データがありません: {STABILIZER_FILE}"
+        )
+
+    stabilizers = {}
+
+    with STABILIZER_FILE.open(
+        "r",
+        encoding="utf-8-sig",
+        newline="",
+    ) as f:
+        reader = csv.DictReader(f)
+
+        for row in reader:
+            if row["状態"] != "OK":
+                continue
+
+            key = (
+                row["日付"].replace("-", "").replace("/", ""),
+                int(row["場番号"]),
+                int(row["R"]),
+            )
+
+            if key in stabilizers:
+                raise ValueError(
+                    f"安定板データに重複があります: {key}"
+                )
+
+            value = row["安定板"]
+
+            if value not in {"有", "無"}:
+                raise ValueError(
+                    f"安定板の値が不正です: {key} = {value}"
+                )
+
+            stabilizers[key] = value
+
+    print(f"安定板データ読込: {len(stabilizers):,}件")
+
+    return stabilizers
 
 def load_grade_file(path):
     """BOAT RACE公式期別ファイルから 登録番号→級別 を取得"""
@@ -104,7 +161,9 @@ def load_all_grades():
         path = DATA_DIR / filename
 
         if not path.exists():
-            raise FileNotFoundError(f"級別ファイルがありません: {path}")
+            raise FileNotFoundError(
+                f"級別ファイルがありません: {path}"
+            )
 
         grades = load_grade_file(path)
 
@@ -127,8 +186,17 @@ def get_grade(race_date, racer_number, grade_periods):
     return None
 
 
+# =========================
+# 風速
+# =========================
+
 def wind_speed_band(speed):
-    """風速を1m単位で集計。6m以上はまとめる"""
+    """
+    レース明細用の基本風速帯
+    弱 = 0～2m
+    中 = 3～4m
+    強 = 5m以上
+    """
     if speed is None:
         return "不明"
 
@@ -137,17 +205,50 @@ def wind_speed_band(speed):
     except (TypeError, ValueError):
         return "不明"
 
-    if speed >= 6:
-        return "6m以上"
+    if speed <= 2:
+        return "弱"
+    elif speed <= 4:
+        return "中"
+    else:
+        return "強"
 
-    return f"{int(speed)}m"
 
+def matches_wind_band(speed, band):
+    """
+    風速帯別集計用。
+    中強は3m以上なので、中・強と重複して集計する。
+    """
+    if speed is None:
+        return False
+
+    try:
+        speed = float(speed)
+    except (TypeError, ValueError):
+        return False
+
+    if band == "弱":
+        return 0 <= speed <= 2
+    if band == "中":
+        return 3 <= speed <= 4
+    if band == "中強":
+        return speed >= 3
+    if band == "強":
+        return speed >= 5
+
+    return False
+
+
+# =========================
+# レース明細作成
+# =========================
 
 def collect_races(grade_periods):
-    """対象期間の全レースから1コース選手の明細を作成"""
     rows = []
-
     json_files = []
+
+    # 安定板データ
+    stabilizer_data = load_stabilizer_data()
+    stabilizer_matched = 0
 
     for year in (2024, 2025, 2026):
         year_dir = RESULT_DIR / str(year)
@@ -170,6 +271,7 @@ def collect_races(grade_periods):
     race_count = 0
     missing_course1 = 0
     missing_grade = 0
+    missing_winner_grade = 0
 
     actual_min_date = None
     actual_max_date = None
@@ -188,10 +290,12 @@ def collect_races(grade_periods):
             if actual_max_date is None or race_date > actual_max_date:
                 actual_max_date = race_date
 
+            boats = race.get("boats", [])
+
             course1 = next(
                 (
                     boat
-                    for boat in race.get("boats", [])
+                    for boat in boats
                     if boat.get("racer_course_number") == 1
                 ),
                 None,
@@ -201,7 +305,9 @@ def collect_races(grade_periods):
                 missing_course1 += 1
                 continue
 
+            # 1コース選手の級別
             racer_number = course1.get("racer_number")
+
             racer_class = get_grade(
                 race_date,
                 racer_number,
@@ -212,7 +318,36 @@ def collect_races(grade_periods):
                 missing_grade += 1
                 racer_class = "不明"
 
+            # 1着選手を探す
+            winner = next(
+                (
+                    boat
+                    for boat in boats
+                    if boat.get("racer_place_number") == 1
+                ),
+                None,
+            )
+
+            winner_class = "不明"
+
+            if winner is not None:
+                winner_number = winner.get("racer_number")
+
+                found_winner_class = get_grade(
+                    race_date,
+                    winner_number,
+                    grade_periods,
+                )
+
+                if found_winner_class is not None:
+                    winner_class = found_winner_class
+                else:
+                    missing_winner_grade += 1
+            else:
+                missing_winner_grade += 1
+
             technique_number = race.get("technique_number")
+
             technique = TECHNIQUES.get(
                 technique_number,
                 f"番号{technique_number}",
@@ -220,20 +355,49 @@ def collect_races(grade_periods):
 
             place = course1.get("racer_place_number")
 
-            # 「逃げ」は1コース選手が1着かつ決まり手が逃げ
+            # 逃げ = 実際の1コース選手が1着、
+            # かつ決まり手番号=1
             is_escape = (
                 place == 1
                 and technique_number == 1
             )
 
             wind_speed = race.get("wind_speed")
+
             wind_direction_number = race.get(
                 "wind_direction_number"
             )
 
-            trifecta = race.get("payouts", {}).get("trifecta", [])
-            trifecta_combination = " / ".join(str(x.get("combination", "")) for x in trifecta)
-            trifecta_amount = " / ".join(str(x.get("amount", "")) for x in trifecta)
+            trifecta = (
+                race.get("payouts", {})
+                .get("trifecta", [])
+            )
+
+            trifecta_combination = " / ".join(
+                str(x.get("combination", ""))
+                for x in trifecta
+            )
+
+            trifecta_amount = " / ".join(
+                str(x.get("amount", ""))
+                for x in trifecta
+            )
+
+            # 安定板データを 日付＋場番号＋R で照合
+            stabilizer_key = (
+                race_date.strftime("%Y%m%d"),
+                int(race.get("stadium_number")),
+                int(race.get("number")),
+            )
+
+            if stabilizer_key not in stabilizer_data:
+                raise ValueError(
+                    f"安定板データが見つかりません: {stabilizer_key}"
+                )
+
+            stabilizer = stabilizer_data[stabilizer_key]
+            stabilizer_matched += 1
+
             rows.append(
                 {
                     "日付": race_date,
@@ -244,42 +408,66 @@ def collect_races(grade_periods):
                     ),
                     "R": race.get("number"),
                     "風向番号": wind_direction_number,
-                "風向": WIND_DIRECTIONS.get(wind_direction_number, "不明"),
+                    "風向": WIND_DIRECTIONS.get(
+                        wind_direction_number,
+                        "不明",
+                    ),
                     "風速": wind_speed,
                     "風速帯": wind_speed_band(wind_speed),
+                    "安定板": stabilizer,
                     "1コース艇番": course1.get(
                         "racer_boat_number"
                     ),
-                    "1コース選手": course1.get("racer_name"),
+                    "1コース選手": course1.get(
+                        "racer_name"
+                    ),
                     "登録番号": racer_number,
                     "級別": racer_class,
-                    "ST": course1.get("racer_start_timing"),
+                    "ST": course1.get(
+                        "racer_start_timing"
+                    ),
                     "1コース着順": place,
                     "決まり手番号": technique_number,
                     "決まり手": technique,
-                    "逃げ": 1 if is_escape else 0,
+                    "1着級別": winner_class,
                     "3連単組合せ": trifecta_combination,
                     "3連単払戻": trifecta_amount,
+                    "逃げ": 1 if is_escape else 0,
                 }
             )
 
         if index % 100 == 0:
             print(
-                f"読込中: {index:,}/{len(json_files):,} "
+                f"読込中: {index:,}/"
+                f"{len(json_files):,} "
                 f"({race_count:,}レース)"
             )
 
     print()
     print(f"総レース数: {race_count:,}")
     print(f"明細行数: {len(rows):,}")
+    print(f"安定板照合数: {stabilizer_matched:,}")
+
+    if stabilizer_matched != len(rows):
+        raise ValueError(
+            f"安定板照合数が明細行数と一致しません: "
+            f"{stabilizer_matched:,} / {len(rows):,}"
+        )
+
     print(f"1コース不明: {missing_course1:,}")
-    print(f"級別不明: {missing_grade:,}")
+    print(f"1コース級別不明: {missing_grade:,}")
+    print(f"1着級別不明: {missing_winner_grade:,}")
     print(f"実データ開始日: {actual_min_date}")
     print(f"実データ終了日: {actual_max_date}")
 
     return rows
+
+
+# =========================
+# 既存集計
+# =========================
+
 def make_summary(rows):
-    """場×風向番号×風速×級別で逃げ率を集計"""
     summary = defaultdict(
         lambda: {
             "レース数": 0,
@@ -300,10 +488,13 @@ def make_summary(rows):
         )
 
         summary[key]["レース数"] += 1
-        if row["3連単払戻"] and row["3連単払戻"].isdigit():
-            summary[key]["3連単払戻合計"] += int(row["3連単払戻"])
-            summary[key]["3連単件数"] += 1
         summary[key]["逃げ数"] += row["逃げ"]
+
+        payout = row["3連単払戻"]
+
+        if payout and payout.isdigit():
+            summary[key]["3連単払戻合計"] += int(payout)
+            summary[key]["3連単件数"] += 1
 
     result = []
 
@@ -316,13 +507,16 @@ def make_summary(rows):
             wind_band,
             racer_class,
         ) = key
-        trifecta_count = values["3連単件数"]
-        avg_trifecta = values["3連単払戻合計"] / trifecta_count if trifecta_count else 0
 
         races = values["レース数"]
         escapes = values["逃げ数"]
+        trifecta_count = values["3連単件数"]
 
-        escape_rate = escapes / races if races else 0
+        avg_trifecta = (
+            values["3連単払戻合計"] / trifecta_count
+            if trifecta_count
+            else 0
+        )
 
         result.append(
             {
@@ -334,15 +528,17 @@ def make_summary(rows):
                 "級別": racer_class,
                 "レース数": races,
                 "逃げ数": escapes,
-                "逃げ率": escape_rate,
+                "逃げ率": escapes / races if races else 0,
                 "平均3連単払戻": avg_trifecta,
             }
         )
 
     result.sort(
         key=lambda x: (
-            x["場番号"] if x["場番号"] is not None else 999,
-            {"北":1,"北東":2,"東":3,"南東":4,"南":5,"南西":6,"西":7,"北西":8,"無風":9,"不明":10}.get(x["風向"],99),
+            x["場番号"]
+            if x["場番号"] is not None
+            else 999,
+            x["風向"],
             x["風速"]
             if x["風速"] is not None
             else 999,
@@ -350,13 +546,10 @@ def make_summary(rows):
         )
     )
 
-    print(f"集計行数: {len(result):,}")
-
     return result
 
 
 def make_class_summary(rows):
-    """場×級別の基本逃げ率も作成"""
     summary = defaultdict(
         lambda: {
             "レース数": 0,
@@ -395,21 +588,83 @@ def make_class_summary(rows):
 
     result.sort(
         key=lambda x: (
-            x["場番号"] if x["場番号"] is not None else 999,
+            x["場番号"]
+            if x["場番号"] is not None
+            else 999,
             x["級別"],
         )
     )
 
     return result
+
+
+# =========================
+# 風速帯別集計
+# =========================
+
+def make_wind_band_summary(rows):
+    """
+    場 × 1コース選手級別 × 風速帯
+    セル表示：
+    逃げ率(対象レース数)
+    例 62.0%(100)
+    """
+
+    classes = ["A1", "A2", "B1", "B2"]
+    bands = ["弱", "中", "中強", "強"]
+
+    summary = {}
+
+    for stadium_number in range(1, 25):
+        for racer_class in classes:
+            for band in bands:
+                summary[
+                    (stadium_number, racer_class, band)
+                ] = {
+                    "レース数": 0,
+                    "逃げ数": 0,
+                }
+
+    for row in rows:
+        stadium_number = row["場番号"]
+        racer_class = row["級別"]
+        speed = row["風速"]
+
+        if racer_class not in classes:
+            continue
+
+        for band in bands:
+            if matches_wind_band(speed, band):
+                key = (
+                    stadium_number,
+                    racer_class,
+                    band,
+                )
+
+                if key not in summary:
+                    continue
+
+                summary[key]["レース数"] += 1
+                summary[key]["逃げ数"] += row["逃げ"]
+
+    return summary
+
+
+# =========================
+# Excel書式
+# =========================
+
 def style_sheet(ws, freeze="A2"):
-    """共通のExcel書式"""
     ws.freeze_panes = freeze
-    ws.auto_filter.ref = ws.dimensions
+
+    if ws.max_row >= 1:
+        ws.auto_filter.ref = ws.dimensions
 
     header_fill = PatternFill(
         fill_type="solid",
         fgColor="1F4E78",
     )
+
     header_font = Font(
         color="FFFFFF",
         bold=True,
@@ -418,12 +673,18 @@ def style_sheet(ws, freeze="A2"):
     for cell in ws[1]:
         cell.fill = header_fill
         cell.font = header_font
-        cell.alignment = Alignment(
-            horizontal="center",
-            vertical="center",
-        )
 
     ws.row_dimensions[1].height = 24
+
+
+def center_all_cells(ws):
+    """シート内の全セルを上下左右中央揃え"""
+    for row in ws.iter_rows():
+        for cell in row:
+            cell.alignment = Alignment(
+                horizontal="center",
+                vertical="center",
+            )
 
 
 def set_widths(ws, widths):
@@ -431,28 +692,16 @@ def set_widths(ws, widths):
         ws.column_dimensions[column].width = width
 
 
-def add_excel_table(ws, name):
-    if ws.max_row < 2:
-        return
+# =========================
+# Excel作成
+# =========================
 
-    table = Table(
-        displayName=name,
-        ref=f"A1:{get_column_letter(ws.max_column)}{ws.max_row}",
-    )
-
-    style = TableStyleInfo(
-        name="TableStyleMedium2",
-        showFirstColumn=False,
-        showLastColumn=False,
-        showRowStripes=True,
-        showColumnStripes=False,
-    )
-
-    table.tableStyleInfo = style
-    ws.add_table(table)
-
-
-def create_workbook(rows, summary_rows, class_summary_rows):
+def create_workbook(
+    rows,
+    summary_rows,
+    class_summary_rows,
+    wind_band_summary,
+):
     print()
     print("Excel作成開始...")
 
@@ -461,6 +710,7 @@ def create_workbook(rows, summary_rows, class_summary_rows):
     # =========================
     # 1. レース明細
     # =========================
+
     ws = wb.active
     ws.title = "レース明細"
 
@@ -472,6 +722,7 @@ def create_workbook(rows, summary_rows, class_summary_rows):
         "風向",
         "風速",
         "風速帯",
+        "安定板",
         "1コース艇番",
         "1コース選手",
         "登録番号",
@@ -480,26 +731,36 @@ def create_workbook(rows, summary_rows, class_summary_rows):
         "1コース着順",
         "決まり手番号",
         "決まり手",
-          "3連単組合せ",
-          "3連単払戻",
+        "1着級別",
+        "3連単組合せ",
+        "3連単払戻",
         "逃げ",
     ]
 
     ws.append(detail_headers)
 
     for row in rows:
-        ws.append(
-            [row[header] for header in detail_headers]
-        )
+        values = []
+
+        for header in detail_headers:
+            value = row[header]
+
+            # 風速だけ「m」を付けて表示
+            if header == "風速" and value is not None:
+                value = f"{value}m"
+
+            values.append(value)
+
+        ws.append(values)
 
     for cell in ws["A"][1:]:
         cell.number_format = "yyyy/mm/dd"
 
-    for cell in ws["L"][1:]:
+    # ST
+    for cell in ws["M"][1:]:
         cell.number_format = "0.00"
 
     style_sheet(ws)
-#    add_excel_table(ws, "RaceDetailTable")
 
     set_widths(
         ws,
@@ -511,23 +772,28 @@ def create_workbook(rows, summary_rows, class_summary_rows):
             "E": 10,
             "F": 8,
             "G": 10,
-            "H": 12,
-            "I": 18,
-            "J": 12,
-            "K": 8,
+            "H": 8,
+            "I": 12,
+            "J": 18,
+            "K": 12,
             "L": 8,
-            "M": 12,
+            "M": 8,
             "N": 12,
-            "O": 14,
-            "P": 8,
+            "O": 12,
+            "P": 14,
+            "Q": 10,
+            "R": 16,
+            "S": 14,
+            "T": 8,
         },
     )
 
     print(f"  レース明細: {len(rows):,}行")
 
     # =========================
-    # 2. 風向・風速・級別集計
+    # 2. 風向風速級別集計
     # =========================
+
     ws2 = wb.create_sheet("風向風速級別集計")
 
     summary_headers = [
@@ -546,9 +812,16 @@ def create_workbook(rows, summary_rows, class_summary_rows):
     ws2.append(summary_headers)
 
     for row in summary_rows:
-        ws2.append(
-            [row[header] for header in summary_headers]
-        )
+        values = [
+            row[header]
+            for header in summary_headers
+        ]
+
+        # 風速列にmを付ける
+        if values[3] is not None:
+            values[3] = f"{values[3]}m"
+
+        ws2.append(values)
 
     for cell in ws2["J"][1:]:
         cell.number_format = '#,##0"円"'
@@ -557,7 +830,6 @@ def create_workbook(rows, summary_rows, class_summary_rows):
         cell.number_format = "0.0%"
 
     style_sheet(ws2)
-#    add_excel_table(ws2, "WindClassSummaryTable")
 
     set_widths(
         ws2,
@@ -571,6 +843,7 @@ def create_workbook(rows, summary_rows, class_summary_rows):
             "G": 12,
             "H": 10,
             "I": 12,
+            "J": 16,
         },
     )
 
@@ -580,8 +853,9 @@ def create_workbook(rows, summary_rows, class_summary_rows):
     )
 
     # =========================
-    # 3. 場・級別集計
+    # 3. 場級別集計
     # =========================
+
     ws3 = wb.create_sheet("場級別集計")
 
     class_headers = [
@@ -597,14 +871,16 @@ def create_workbook(rows, summary_rows, class_summary_rows):
 
     for row in class_summary_rows:
         ws3.append(
-            [row[header] for header in class_headers]
+            [
+                row[header]
+                for header in class_headers
+            ]
         )
 
     for cell in ws3["F"][1:]:
         cell.number_format = "0.0%"
 
     style_sheet(ws3)
-#    add_excel_table(ws3, "ClassSummaryTable")
 
     set_widths(
         ws3,
@@ -621,10 +897,73 @@ def create_workbook(rows, summary_rows, class_summary_rows):
     print(
         f"  場級別集計: "
         f"{len(class_summary_rows):,}行"
-    )    # =========================
-    # 4. 説明・診断
+    )
+
     # =========================
-    ws4 = wb.create_sheet("説明")
+    # 4. 風速帯別集計
+    # =========================
+
+    ws4 = wb.create_sheet("風速帯別集計")
+
+    classes = ["A1", "A2", "B1", "B2"]
+    bands = ["弱", "中", "中強", "強"]
+
+    headers = ["場"]
+
+    for racer_class in classes:
+        for band in bands:
+            headers.append(
+                f"{racer_class}({band})"
+            )
+
+    ws4.append(headers)
+
+    for stadium_number in range(1, 25):
+        values = [
+            STADIUMS[stadium_number]
+        ]
+
+        for racer_class in classes:
+            for band in bands:
+                data = wind_band_summary[
+                    (
+                        stadium_number,
+                        racer_class,
+                        band,
+                    )
+                ]
+
+                races = data["レース数"]
+                escapes = data["逃げ数"]
+
+                if races:
+                    rate = escapes / races * 100
+                    display = (
+                        f"{rate:.1f}%({races})"
+                    )
+                else:
+                    display = "0.0%(0)"
+
+                values.append(display)
+
+        ws4.append(values)
+
+    style_sheet(ws4)
+
+    ws4.column_dimensions["A"].width = 12
+
+    for col in range(2, 18):
+        ws4.column_dimensions[
+            get_column_letter(col)
+        ].width = 14
+
+    print("  風速帯別集計: 24場 × 16条件")
+
+    # =========================
+    # 5. 説明
+    # =========================
+
+    ws5 = wb.create_sheet("説明")
 
     actual_dates = [
         row["日付"]
@@ -632,14 +971,34 @@ def create_workbook(rows, summary_rows, class_summary_rows):
         if row.get("日付") is not None
     ]
 
-    actual_start = min(actual_dates) if actual_dates else None
-    actual_end = max(actual_dates) if actual_dates else None
-
-    unknown_grade = sum(
-        1 for row in rows if row["級別"] == "不明"
+    actual_start = (
+        min(actual_dates)
+        if actual_dates
+        else None
     )
 
-    escape_count = sum(row["逃げ"] for row in rows)
+    actual_end = (
+        max(actual_dates)
+        if actual_dates
+        else None
+    )
+
+    unknown_grade = sum(
+        1
+        for row in rows
+        if row["級別"] == "不明"
+    )
+
+    unknown_winner_grade = sum(
+        1
+        for row in rows
+        if row["1着級別"] == "不明"
+    )
+
+    escape_count = sum(
+        row["逃げ"]
+        for row in rows
+    )
 
     info_rows = [
         ["項目", "内容"],
@@ -651,9 +1010,12 @@ def create_workbook(rows, summary_rows, class_summary_rows):
         ["逃げ数", escape_count],
         [
             "全体逃げ率",
-            escape_count / len(rows) if rows else 0,
+            escape_count / len(rows)
+            if rows
+            else 0,
         ],
-        ["級別不明件数", unknown_grade],
+        ["1コース級別不明件数", unknown_grade],
+        ["1着級別不明件数", unknown_winner_grade],
         [
             "1コースの定義",
             "racer_course_number = 1 の実際の1コース進入選手",
@@ -667,55 +1029,82 @@ def create_workbook(rows, summary_rows, class_summary_rows):
             "各レース開催日時点の適用期別ファイルから取得",
         ],
         [
-            "集計単位",
-            "場 × 風向番号 × 風速 × 級別",
+            "風速帯：弱",
+            "0m～2m",
+        ],
+        [
+            "風速帯：中",
+            "3m～4m",
+        ],
+        [
+            "風速帯：中強",
+            "3m以上（中・強と重複して集計）",
+        ],
+        [
+            "風速帯：強",
+            "5m以上",
+        ],
+        [
+            "風速帯別集計",
+            "1着選手の級別 × 風速帯ごとに、逃げ率(対象レース数)を表示",
+        ],
+        [
+            "風速帯別集計の例",
+            "62.0%(100) = 対象100レース中、逃げ62レース",
+        ],
+        [
+            "既存集計単位",
+            "場 × 風向 × 風速 × 1コース選手級別",
         ],
     ]
 
     for info in info_rows:
-        ws4.append(info)
+        ws5.append(info)
 
     for row_number in range(2, 6):
-        ws4.cell(row=row_number, column=2).number_format = (
-            "yyyy/mm/dd"
-        )
+        ws5.cell(
+            row=row_number,
+            column=2,
+        ).number_format = "yyyy/mm/dd"
 
-    ws4["B8"].number_format = "0.0%"
+    ws5["B8"].number_format = "0.0%"
 
-    header_fill = PatternFill(
-        fill_type="solid",
-        fgColor="1F4E78",
-    )
-    header_font = Font(
-        color="FFFFFF",
-        bold=True,
-    )
+    style_sheet(ws5)
 
-    for cell in ws4[1]:
-        cell.fill = header_fill
-        cell.font = header_font
+    ws5.column_dimensions["A"].width = 28
+    ws5.column_dimensions["B"].width = 75
 
-    ws4.column_dimensions["A"].width = 24
-    ws4.column_dimensions["B"].width = 70
-    ws4.freeze_panes = "A2"
+    # =========================
+    # 全シート中央揃え
+    # =========================
+
+    for sheet in wb.worksheets:
+        center_all_cells(sheet)
 
     # =========================
     # 保存
     # =========================
+
     wb.save(OUTPUT_FILE)
 
     print()
     print("=" * 60)
     print("Excel完成")
     print(f"保存先: {OUTPUT_FILE}")
-    print(f"ファイルサイズ: {OUTPUT_FILE.stat().st_size:,} bytes")
+    print(
+        f"ファイルサイズ: "
+        f"{OUTPUT_FILE.stat().st_size:,} bytes"
+    )
     print("=" * 60)
 
 
 def main():
     print("=" * 60)
     print("BOAT RACE 1コース逃げ率分析")
-    print(f"指定期間: {START_DATE} ～ {END_DATE}")
+    print(
+        f"指定期間: "
+        f"{START_DATE} ～ {END_DATE}"
+    )
     print("=" * 60)
     print()
 
@@ -735,15 +1124,22 @@ def main():
     print("集計開始...")
 
     summary_rows = make_summary(rows)
-    class_summary_rows = make_class_summary(rows)
+
+    class_summary_rows = make_class_summary(
+        rows
+    )
+
+    wind_band_summary = make_wind_band_summary(
+        rows
+    )
 
     create_workbook(
         rows,
         summary_rows,
         class_summary_rows,
+        wind_band_summary,
     )
 
 
 if __name__ == "__main__":
     main()
-    
