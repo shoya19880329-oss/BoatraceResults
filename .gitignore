@@ -3,3 +3,7 @@
 /vendor
 .phpunit.result.cache
 composer.lock
+
+# BOAT RACE local database / cache
+analysis_data/sqlite/*.sqlite
+analysis_data/sqlite/html_cache/
