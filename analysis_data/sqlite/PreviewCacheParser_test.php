@@ -21,6 +21,8 @@ final class PreviewCacheParser
      */
     private string $baseXPath = 'descendant-or-self::body/main/div/div/div';
 
+    private int $baseLevel = 0;
+
     /**
      * @psalm-param \Carbon\CarbonInterface $date
      * @psalm-param int<1, 24> $stadiumNumber
