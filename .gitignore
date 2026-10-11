@@ -7,3 +7,9 @@ composer.lock
 # BOAT RACE local database / cache
 analysis_data/sqlite/*.sqlite
 analysis_data/sqlite/html_cache/
+
+# Daily BOAT RACE local runtime files
+daily_boatrace.lock
+daily_verification/
+logs/
+scraper.php.backup

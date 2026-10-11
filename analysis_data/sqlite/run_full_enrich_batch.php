@@ -1,9 +1,72 @@
 <?php
 declare(strict_types=1);
 
-$dbPath = __DIR__ . '/boatrace_master.sqlite';
+$dbPath = 'C:/Users/shoya/Desktop/BoatraceData/boatrace_master.sqlite';
 $fetchSource = __DIR__ . '/fetch_html_cache_test.php';
 $enrichSource = __DIR__ . '/enrich_full_detail.php';
+
+// File-backed output avoids pipe deadlocks on native Windows, including
+// while other fetch workers are waiting to be collected.
+function startRaceProcess(string $source, array $row): array
+{
+    $environment = getenv();
+    if ($environment === false) {
+        throw new RuntimeException('Cannot read the inherited environment.');
+    }
+    $environment['BR_DATE'] = (string)$row['race_date'];
+    $environment['BR_STADIUM'] = (string)(int)$row['stadium_number'];
+    $environment['BR_RACE'] = (string)(int)$row['race_number'];
+
+    $stdout = tmpfile();
+    $stderr = tmpfile();
+    $process = null;
+    try {
+        if ($stdout === false || $stderr === false) {
+            throw new RuntimeException('Cannot create child output files.');
+        }
+        $pipes = [];
+        $process = proc_open(
+            [PHP_BINARY, $source],
+            [
+                0 => ['file', 'NUL', 'r'],
+                1 => $stdout,
+                2 => $stderr,
+            ],
+            $pipes,
+            __DIR__,
+            $environment,
+            ['bypass_shell' => true]
+        );
+        if (!is_resource($process)) {
+            throw new RuntimeException('Cannot start child: ' . $source);
+        }
+        return compact('process', 'stdout', 'stderr', 'row');
+    } finally {
+        if (!is_resource($process)) {
+            if (is_resource($stdout)) {
+                fclose($stdout);
+            }
+            if (is_resource($stderr)) {
+                fclose($stderr);
+            }
+        }
+    }
+}
+
+function finishRaceProcess(array $item): int
+{
+    try {
+        $exitCode = proc_close($item['process']);
+        rewind($item['stdout']);
+        rewind($item['stderr']);
+        stream_copy_to_stream($item['stdout'], STDOUT);
+        stream_copy_to_stream($item['stderr'], STDERR);
+        return $exitCode;
+    } finally {
+        fclose($item['stdout']);
+        fclose($item['stderr']);
+    }
+}
 
 $batchLimit = (int)(getenv('BR_BATCH_LIMIT') ?: 100);
 $fetchWorkers = (int)(getenv('BR_FETCH_WORKERS') ?: 10);
@@ -13,6 +76,10 @@ if ($batchLimit < 1) {
 }
 if ($fetchWorkers < 1) {
     throw new RuntimeException('BR_FETCH_WORKERS は1以上にしてください。');
+}
+
+if (!is_file($dbPath)) {
+    throw new RuntimeException('Database file does not exist: ' . $dbPath);
 }
 
 $pdo = new PDO('sqlite:' . $dbPath);
@@ -60,58 +127,26 @@ foreach (array_chunk($rows, $fetchWorkers) as $chunkIndex => $chunk) {
         $stadium = (int)$row['stadium_number'];
         $race = (int)$row['race_number'];
 
-        $command =
-            'BR_DATE=' . escapeshellarg($date) . ' ' .
-            'BR_STADIUM=' . escapeshellarg((string)$stadium) . ' ' .
-            'BR_RACE=' . escapeshellarg((string)$race) . ' ' .
-            'php ' . escapeshellarg($fetchSource);
-
-        $pipes = [];
-        $process = proc_open(
-            $command,
-            [
-                0 => ['file', '/dev/null', 'r'],
-                1 => ['pipe', 'w'],
-                2 => ['pipe', 'w'],
-            ],
-            $pipes
-        );
-
-        if (!is_resource($process)) {
-            throw new RuntimeException(
-                "HTML取得プロセス起動失敗: {$date} 場{$stadium} {$race}R"
-            );
+        try {
+            $processes[] = startRaceProcess($fetchSource, $row);
+        } catch (Throwable $e) {
+            // Reap workers already started and close their temporary files.
+            foreach ($processes as $item) {
+                finishRaceProcess($item);
+            }
+            throw $e;
         }
-
-        $processes[] = [
-            'process' => $process,
-            'pipes' => $pipes,
-            'row' => $row,
-        ];
     }
 
     $fetchFailed = false;
 
     foreach ($processes as $item) {
-        $stdout = stream_get_contents($item['pipes'][1]);
-        $stderr = stream_get_contents($item['pipes'][2]);
-
-        fclose($item['pipes'][1]);
-        fclose($item['pipes'][2]);
-
-        $exitCode = proc_close($item['process']);
+        $exitCode = finishRaceProcess($item);
 
         $row = $item['row'];
         $date = $row['race_date'];
         $stadium = (int)$row['stadium_number'];
         $race = (int)$row['race_number'];
-
-        if ($stdout !== '') {
-            echo $stdout;
-        }
-        if ($stderr !== '') {
-            fwrite(STDERR, $stderr);
-        }
 
         if ($exitCode !== 0) {
             echo "HTML取得ERROR: {$date} 場{$stadium} {$race}R\n";
@@ -131,13 +166,8 @@ foreach (array_chunk($rows, $fetchWorkers) as $chunkIndex => $chunk) {
         $stadium = (int)$row['stadium_number'];
         $race = (int)$row['race_number'];
 
-        $command =
-            'BR_DATE=' . escapeshellarg($date) . ' ' .
-            'BR_STADIUM=' . escapeshellarg((string)$stadium) . ' ' .
-            'BR_RACE=' . escapeshellarg((string)$race) . ' ' .
-            'php ' . escapeshellarg($enrichSource);
-
-        passthru($command, $exitCode);
+        // Wait for each enrichment child before starting the next DB writer.
+        $exitCode = finishRaceProcess(startRaceProcess($enrichSource, $row));
 
         if ($exitCode !== 0) {
             echo "DB登録ERROR: {$date} 場{$stadium} {$race}R\n";

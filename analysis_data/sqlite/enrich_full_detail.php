@@ -401,7 +401,10 @@ function raceTimeToSeconds(string $time): ?float
     return null;
 }
 
-$dbPath = __DIR__ . '/boatrace_master.sqlite';
+$dbPath = 'C:/Users/shoya/Desktop/BoatraceData/boatrace_master.sqlite';
+if (!is_file($dbPath)) {
+    throw new RuntimeException('Database file does not exist: ' . $dbPath);
+}
 
 $date = getenv('BR_DATE') ?: '2024-01-01';
 $carbonDate = \Carbon\CarbonImmutable::parse($date);
@@ -655,6 +658,11 @@ $remarksNode = $resultXpath->query(
 $remarks =
     $remarksNode ? cleanText($remarksNode->textContent) : '';
 
+// Check again immediately before PDO, which otherwise creates a missing DB.
+clearstatcache(true, $dbPath);
+if (!is_file($dbPath)) {
+    throw new RuntimeException('Database file does not exist: ' . $dbPath);
+}
 $pdo = new PDO('sqlite:' . $dbPath);
 $pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
 $pdo->exec('PRAGMA busy_timeout = 30000');
@@ -717,7 +725,10 @@ if (!$program || !$preview || !$result) {
     throw new RuntimeException('Program / Preview / Result の取得に失敗しました。');
 }
 
-$pdo->beginTransaction();
+// Acquire the writer lock before reading status to prevent competing writers
+// from completing this race between the guard and enrichment writes.
+$pdo->exec('BEGIN IMMEDIATE');
+$transactionActive = true;
 
 try {
     /*
@@ -725,7 +736,7 @@ try {
      * 既存データは削除しない。
      */
     $stmt = $pdo->prepare(
-        'SELECT race_id
+        'SELECT race_id, extra_fetch_status
          FROM races
          WHERE race_date = ?
            AND stadium_number = ?
@@ -733,13 +744,21 @@ try {
     );
     $stmt->execute([$date, $stadiumNumber, $raceNumber]);
 
-    $existingRaceId = $stmt->fetchColumn();
+    $existingRace = $stmt->fetch(PDO::FETCH_ASSOC);
+    $stmt->closeCursor();
 
-    if ($existingRaceId === false) {
+    if ($existingRace === false) {
         throw new RuntimeException('対象レースがSQLiteにありません。');
     }
 
-    $raceId = (int)$existingRaceId;
+    if ($existingRace['extra_fetch_status'] === 'success') {
+        $pdo->exec('ROLLBACK');
+        $transactionActive = false;
+        echo "Already enriched: {$date} stadium {$stadiumNumber} {$raceNumber}R\n";
+        exit(0);
+    }
+
+    $raceId = (int)$existingRace['race_id'];
 
     /*
      * races
@@ -1185,7 +1204,8 @@ try {
         $raceId,
     ]);
 
-    $pdo->commit();
+    $pdo->exec('COMMIT');
+    $transactionActive = false;
 
     /*
      * 登録結果の検証
@@ -1219,8 +1239,8 @@ try {
     echo "racers: {$racerCount}\n";
 
 } catch (Throwable $e) {
-    if ($pdo->inTransaction()) {
-        $pdo->rollBack();
+    if ($transactionActive) {
+        $pdo->exec('ROLLBACK');
     }
 
     throw $e;
