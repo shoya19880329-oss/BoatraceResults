@@ -1,3 +1,4 @@
+﻿import os
 from pathlib import Path
 from collections import defaultdict
 from datetime import date
@@ -624,10 +625,15 @@ def create_workbook(
     print()
     print("Excel作成開始...")
 
-    output_file = DATA_DIR / (
-        "boat_escape_wind_class_stabilizer_"
-        f"{START_DATE:%Y%m%d}_{end_date:%Y%m%d}.xlsx"
-    )
+    auto_output = os.environ.get("BR_EXCEL_OUTPUT")
+
+    if auto_output:
+        output_file = Path(auto_output)
+    else:
+        output_file = DATA_DIR / (
+            "boat_escape_wind_class_stabilizer_"
+            f"{START_DATE:%Y%m%d}_{end_date:%Y%m%d}.xlsx"
+        )
 
     wb = Workbook()
 

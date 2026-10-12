@@ -1,4 +1,4 @@
-# Daily coordinator for the existing Windows installation. Windows PowerShell 5.1+.
+﻿# Daily coordinator for the existing Windows installation. Windows PowerShell 5.1+.
 [CmdletBinding()]
 param()
 Set-StrictMode -Version Latest
@@ -419,6 +419,29 @@ try {
         Write-Log "Verified date after enrichment: $($audit.Date)"
     }
     New-ValidatedBackup 'post_success'
+
+    Write-Log 'Creating latest Excel workbook'
+    $excelFinal = Join-Path $env:USERPROFILE 'Desktop\boat_escape_wind_class_stabilizer_latest.xlsx'
+    $excelTemp = Join-Path $env:USERPROFILE 'Desktop\boat_escape_wind_class_stabilizer_latest.tmp.xlsx'
+
+    try {
+        $env:BR_EXCEL_OUTPUT = $excelTemp
+        Invoke-Native 'python' @('analysis_data\make_escape_wind_class_stabilizer_sqlite.py')
+
+        if (-not (Test-Path $excelTemp)) {
+            throw 'Excel output file was not created'
+        }
+
+        Move-Item -Force $excelTemp $excelFinal
+        Write-Log "Latest Excel completed: $excelFinal"
+    }
+    finally {
+        Remove-Item Env:BR_EXCEL_OUTPUT -ErrorAction SilentlyContinue
+        if (Test-Path $excelTemp) {
+            Remove-Item -Force $excelTemp -ErrorAction SilentlyContinue
+        }
+    }
+
     Write-Log 'Coordinator completed; all strict-policy dates verified'
     $exitCode = 0
 } catch {
