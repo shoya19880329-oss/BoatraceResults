@@ -893,10 +893,156 @@ def create_workbook(
         "24場 × 4級別 × 4風速帯 × 2安定板条件"
     )
     # ========================================================
-    # 5. 説明
+    # 5. 人気
     # ========================================================
 
-    ws5 = wb.create_sheet("説明")
+    ws5 = wb.create_sheet("人気")
+
+    popularity_headers = [
+        "場・風向",
+        "人気",
+        "3連単払戻",
+        "風速2ｍ",
+        "風速帯中",
+        "風速帯強",
+        "人気(安)",
+        "3連単払戻(安)",
+        "風速2ｍ(安)",
+        "風速帯中(安)",
+        "風速帯強(安)",
+    ]
+    ws5.append(popularity_headers)
+
+    popularity_directions = [
+        "東", "西", "南", "北",
+        "南東", "北東", "南西", "北西",
+    ]
+
+    def numeric_parts(value):
+        if value is None or value == "":
+            return []
+        result = []
+        for part in str(value).split("/"):
+            cleaned = (
+                part.replace(",", "")
+                .replace("円", "")
+                .strip()
+            )
+            try:
+                result.append(float(cleaned))
+            except ValueError:
+                pass
+        return result
+
+    for stadium_number in range(1, 25):
+        stadium = STADIUMS[stadium_number]
+
+        for direction in popularity_directions:
+            matched = [
+                row for row in rows
+                if row["場番号"] == stadium_number
+                and row["風向"] == direction
+            ]
+
+            output = [f"{stadium}({direction})"]
+
+            for stabilizer in ["なし", "あり"]:
+                target = [
+                    row for row in matched
+                    if row["安定板"] == stabilizer
+                ]
+
+                speed_2_or_more = [
+                    row for row in target
+                    if row["風速"] is not None
+                    and float(row["風速"]) >= 2
+                ]
+
+                popularity_values = []
+                payout_values = []
+
+                for row in speed_2_or_more:
+                    popularity_values.extend(
+                        numeric_parts(row["人気"])
+                    )
+                    payout_values.extend(
+                        numeric_parts(row["3連単払戻"])
+                    )
+
+                avg_popularity = (
+                    sum(popularity_values) / len(popularity_values)
+                    if popularity_values else None
+                )
+                avg_payout = (
+                    sum(payout_values) / len(payout_values)
+                    if payout_values else None
+                )
+
+                speed_2_count = sum(
+                    1 for row in target
+                    if row["風速"] is not None
+                    and float(row["風速"]) == 2
+                )
+                medium_count = sum(
+                    1 for row in target
+                    if row["風速帯"] == "中"
+                )
+                strong_count = sum(
+                    1 for row in target
+                    if row["風速帯"] == "強"
+                )
+
+                output.extend([
+                    avg_popularity,
+                    avg_payout,
+                    speed_2_count,
+                    medium_count,
+                    strong_count,
+                ])
+
+            ws5.append(output)
+
+    style_sheet(ws5)
+    ws5.column_dimensions["A"].width = 18
+
+    for col in range(2, len(popularity_headers) + 1):
+        ws5.column_dimensions[get_column_letter(col)].width = 18
+
+    for row_cells in ws5.iter_rows(
+        min_row=2,
+        min_col=2,
+        max_col=2,
+    ):
+        row_cells[0].number_format = "0.0"
+
+    for row_cells in ws5.iter_rows(
+        min_row=2,
+        min_col=7,
+        max_col=7,
+    ):
+        row_cells[0].number_format = "0.0"
+
+    for row_cells in ws5.iter_rows(
+        min_row=2,
+        min_col=3,
+        max_col=3,
+    ):
+        row_cells[0].number_format = "#,##0"
+
+    for row_cells in ws5.iter_rows(
+        min_row=2,
+        min_col=8,
+        max_col=8,
+    ):
+        row_cells[0].number_format = "#,##0"
+
+    print("  人気: 24場 × 8風向")
+
+    # ========================================================
+    # 6. 説明
+    # ========================================================
+
+    ws6 = wb.create_sheet("説明")
 
     escape_count = sum(
         row["逃げ"]
@@ -983,10 +1129,10 @@ def create_workbook(
     ]
 
     for info in info_rows:
-        ws5.append(info)
+        ws6.append(info)
 
     for row_number in (2, 3):
-        ws5.cell(
+        ws6.cell(
             row=row_number,
             column=2,
         ).number_format = "yyyy/mm/dd"
@@ -995,8 +1141,8 @@ def create_workbook(
 
     style_sheet(ws5)
 
-    ws5.column_dimensions["A"].width = 30
-    ws5.column_dimensions["B"].width = 80
+    ws6.column_dimensions["A"].width = 30
+    ws6.column_dimensions["B"].width = 80
 
     # ========================================================
     # 全シート中央揃え
