@@ -64,6 +64,8 @@ WIND_DIRECTIONS = {
     17: "無風",
 }
 
+WIND_DIRECTIONS_2 = {1: chr(8593), 2: chr(8593)+chr(8599), 3: chr(8599), 4: chr(8594)+chr(8599), 5: chr(8594), 6: chr(8594)+chr(8600), 7: chr(8600), 8: chr(8595)+chr(8600), 9: chr(8595), 10: chr(8595)+chr(8601), 11: chr(8601), 12: chr(8592)+chr(8601), 13: chr(8592), 14: chr(8592)+chr(8598), 15: chr(8598), 16: chr(8593)+chr(8598), 17: chr(28961)+chr(39080)}
+
 TECHNIQUES = {
     1: "逃げ",
     2: "差し",
@@ -337,6 +339,7 @@ def collect_races(conn, end_date):
                     wind_direction_number,
                     "不明",
                 ),
+                "風向2": WIND_DIRECTIONS_2.get(wind_direction_number, "不明"),
                 "風速": wind_speed,
                 "風速帯": wind_speed_band(wind_speed),
                 "安定板": stabilizer,
@@ -392,6 +395,7 @@ def make_summary(rows):
             row["場番号"],
             row["場"],
             row["風向"],
+            row["風向2"],
             row["風速"],
             row["風速帯"],
             row["級別"],
@@ -427,6 +431,7 @@ def make_summary(rows):
             stadium_number,
             stadium,
             wind_direction,
+            wind_direction2,
             wind_speed,
             wind_band,
             racer_class,
@@ -448,6 +453,7 @@ def make_summary(rows):
                 "場番号": stadium_number,
                 "場": stadium,
                 "風向": wind_direction,
+                "風向2": wind_direction2,
                 "風速": wind_speed,
                 "風速帯": wind_band,
                 "級別": racer_class,
@@ -650,6 +656,7 @@ def create_workbook(
         "場",
         "R",
         "風向",
+        "風向2",
         "風速",
         "風速帯",
         "安定板",
@@ -737,6 +744,7 @@ def create_workbook(
         "場番号",
         "場",
         "風向",
+        "風向2",
         "風速",
         "風速帯",
         "級別",
@@ -755,15 +763,15 @@ def create_workbook(
             for header in summary_headers
         ]
 
-        if values[3] is not None:
-            values[3] = f"{values[3]:g}m"
+        if values[4] is not None:
+            values[4] = f"{values[4]:g}m"
 
         ws2.append(values)
 
-    for cell in ws2["J"][1:]:
+    for cell in ws2["K"][1:]:
         cell.number_format = "0.0%"
 
-    for cell in ws2["K"][1:]:
+    for cell in ws2["L"][1:]:
         cell.number_format = '#,##0"円"'
 
     style_sheet(ws2)
